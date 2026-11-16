@@ -7,11 +7,13 @@ LifeCheck - 생활용품 사용 기간 관리 프로그램 (main.py)
 - 상태별(전체, 기간임박, 기간만료, 사용가능) 실시간 목록 필터링
 - 목록 선택 시 입력폼 자동 완성 및 상태별 하이라이트 색상 태그
 - 입력값 유효성 검사 및 안내 대화상자(messagebox) 연동
+- 추가 기능 4·5의 GUI 연동과 이벤트 처리는 팀원 3 (계산·테스트 담당) 작업
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 from datetime import date
+import csv
 
 import storage
 import calculator
@@ -21,14 +23,23 @@ class LifeCheckApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("LifeCheck - 생활용품 사용 기간 관리 프로그램")
-        self.root.geometry("1020x620")
-        self.root.minsize(900, 550)
+        self.root.geometry("1160x720")
+        self.root.minsize(980, 660)
 
         # 현재 선택된 제품의 ID (수정/삭제 시 사용, 미선택 시 None)
         self.selected_item_id = None
+        self.selected_item_status = None
 
         # 필터 상태 변수 ("전체", "기간임박", "기간만료", "사용가능")
         self.filter_var = tk.StringVar(value="전체")
+        # [추가 기능 / 팀원 3] 기존 화면에 검색·이력·알림 설정만 확장
+        self.view_var = tk.StringVar(value="사용 중")
+        self.search_var = tk.StringVar()
+        self.category_filter_var = tk.StringVar(value="전체")
+        self.sort_var = tk.StringVar(value="등록 순")
+        self.urgent_days = storage.load_settings()["urgent_days"]
+        self.urgent_days_var = tk.StringVar(value=str(self.urgent_days))
+        self.current_date = date.today()
 
         # 스타일 설정
         self.setup_styles()
@@ -37,8 +48,10 @@ class LifeCheckApp:
         self.create_widgets()
 
         # 데이터베이스(CSV) 초기화 및 첫 화면 목록 갱신
-        storage.init_storage()
         self.refresh_item_list()
+        self.search_var.trace_add("write", lambda *_: self.refresh_item_list())
+        self.root.after_idle(self.show_startup_alert)
+        self.root.after(60000, self.check_date_change)
 
     def setup_styles(self):
         """GUI 위젯 스타일 지정"""
@@ -65,8 +78,8 @@ class LifeCheckApp:
         title_label = ttk.Label(header_frame, text="✨ LifeCheck - 생활용품 사용 기간 관리", style="Title.TLabel")
         title_label.pack(side=tk.LEFT)
         today_str = date.today().strftime("%Y년 %m월 %d일")
-        today_label = ttk.Label(header_frame, text=f"기준일: {today_str}", font=("Malgun Gothic", 9), foreground="#7F8C8D")
-        today_label.pack(side=tk.RIGHT, pady=5)
+        self.today_label = ttk.Label(header_frame, text=f"기준일: {today_str}", font=("Malgun Gothic", 9), foreground="#7F8C8D")
+        self.today_label.pack(side=tk.RIGHT, pady=5)
 
         # 메인 컨테이너 (좌측 입력창 + 우측 목록창)
         main_container = ttk.Frame(self.root, padding="15 5 15 15")
@@ -134,6 +147,13 @@ class LifeCheckApp:
         self.btn_clear = ttk.Button(btn_frame, text="🔄 초기화", command=self.clear_input_fields)
         self.btn_clear.grid(row=1, column=1, padx=2, pady=3, sticky="ew")
 
+        self.btn_complete = ttk.Button(btn_frame, text="사용 완료", command=self.handle_complete)
+        self.btn_complete.grid(row=2, column=0, padx=2, pady=3, sticky="ew")
+
+        self.btn_register_again = ttk.Button(btn_frame, text="같은 제품 다시 등록", command=self.handle_register_again)
+        self.btn_register_again.grid(row=2, column=1, padx=2, pady=3, sticky="ew")
+        self.update_action_buttons()
+
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
 
@@ -150,10 +170,45 @@ class LifeCheckApp:
         self.lbl_stat_expired = ttk.Label(summary_frame, text="🚨 기간 만료: 0개", font=("Malgun Gothic", 9, "bold"), foreground="#C0392B")
         self.lbl_stat_expired.pack(anchor=tk.W, pady=1)
 
+        self.lbl_stat_completed = ttk.Label(summary_frame, text="사용 완료 이력: 0개")
+        self.lbl_stat_completed.pack(anchor=tk.W, pady=1)
+
     def create_right_panel(self, parent):
         """우측 필터 및 Treeview 목록 패널"""
         right_frame = ttk.LabelFrame(parent, text=" [ 생활용품 목록 및 상태 ] ", padding="15")
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # [추가 기능 / 팀원 3] 기존 목록 위에 조회 및 알림 설정 추가
+        toolbar = ttk.Frame(right_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 8))
+        view_combo = ttk.Combobox(toolbar, textvariable=self.view_var,
+                                  values=["사용 중", "사용 완료 이력"], state="readonly", width=14)
+        view_combo.pack(side=tk.LEFT, padx=(0, 8))
+        view_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_item_list())
+        ttk.Label(toolbar, text="임박 기준").pack(side=tk.LEFT)
+        urgent_combo = ttk.Combobox(toolbar, textvariable=self.urgent_days_var,
+                                    values=[str(d) for d in storage.URGENT_DAY_OPTIONS],
+                                    state="readonly", width=3)
+        urgent_combo.pack(side=tk.LEFT, padx=4)
+        urgent_combo.bind("<<ComboboxSelected>>", self.handle_urgent_days_change)
+        ttk.Label(toolbar, text="일").pack(side=tk.LEFT, padx=(0, 10))
+        self.sort_combo = ttk.Combobox(toolbar, textvariable=self.sort_var,
+                                       values=["등록 순", "남은 기간순"], state="readonly", width=12)
+        self.sort_combo.pack(side=tk.LEFT)
+        self.sort_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_item_list())
+        ttk.Button(toolbar, text="새로 고침", command=self.refresh_item_list).pack(side=tk.RIGHT)
+
+        search_frame = ttk.Frame(right_frame)
+        search_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(search_frame, text="제품명 검색").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Entry(search_frame, textvariable=self.search_var, width=18).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        ttk.Label(search_frame, text="분류").pack(side=tk.LEFT, padx=(0, 5))
+        self.category_filter_combo = ttk.Combobox(
+            search_frame, textvariable=self.category_filter_var, values=["전체"],
+            state="readonly", width=10)
+        self.category_filter_combo.pack(side=tk.LEFT)
+        self.category_filter_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_item_list())
 
         # 상단 필터 영역
         filter_frame = ttk.Frame(right_frame)
@@ -161,7 +216,8 @@ class LifeCheckApp:
 
         ttk.Label(filter_frame, text="보기 필터: ", font=("Malgun Gothic", 9, "bold")).pack(side=tk.LEFT, padx=(0, 5))
 
-        filters = [("전체 보기", "전체"), ("⚠️ 기간 임박 (30일 이내)", "기간임박"), ("🚨 기간 만료", "기간만료"), ("✅ 사용 가능", "사용가능")]
+        filters = [("전체 보기", "전체"), ("⚠️ 기간 임박", "기간임박"), ("🚨 기간 만료", "기간만료"), ("✅ 사용 가능", "사용가능")]
+        self.status_filter_buttons = []
         for text, mode in filters:
             rb = ttk.Radiobutton(
                 filter_frame,
@@ -171,10 +227,15 @@ class LifeCheckApp:
                 command=self.refresh_item_list
             )
             rb.pack(side=tk.LEFT, padx=6)
+            self.status_filter_buttons.append(rb)
 
         # Treeview 표 (목록)
-        columns = ("id", "name", "category", "open_date", "end_date", "remaining", "status")
-        self.tree = ttk.Treeview(right_frame, columns=columns, show="headings", selectmode="browse")
+        columns = ("id", "name", "category", "open_date", "end_date", "remaining", "status", "completed_date")
+        list_frame = ttk.Frame(right_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
 
         # 각 컬럼 헤더 및 너비 설정
         self.tree.heading("id", text="ID")
@@ -184,6 +245,7 @@ class LifeCheckApp:
         self.tree.heading("end_date", text="사용종료일")
         self.tree.heading("remaining", text="남은 기간")
         self.tree.heading("status", text="상태")
+        self.tree.heading("completed_date", text="사용 완료일")
 
         self.tree.column("id", width=40, anchor=tk.CENTER)
         self.tree.column("name", width=140, anchor=tk.W)
@@ -192,13 +254,17 @@ class LifeCheckApp:
         self.tree.column("end_date", width=90, anchor=tk.CENTER)
         self.tree.column("remaining", width=80, anchor=tk.CENTER)
         self.tree.column("status", width=80, anchor=tk.CENTER)
+        self.tree.column("completed_date", width=95, anchor=tk.CENTER)
 
         # 스크롤바 연결
-        scrollbar = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        horizontal = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.list_count_label = ttk.Label(right_frame, text="조회 결과: 0개")
+        self.list_count_label.pack(anchor=tk.W, pady=(5, 0))
 
         # 항목 선택 이벤트 바인딩
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
@@ -207,6 +273,8 @@ class LifeCheckApp:
         self.tree.tag_configure("expired", foreground="#C0392B", background="#FDEDEC")  # 연한 빨강
         self.tree.tag_configure("urgent", foreground="#D35400", background="#FEF9E7")   # 연한 주황
         self.tree.tag_configure("normal", foreground="#27AE60")                         # 초록
+        self.tree.tag_configure("completed", foreground="#616A6B")
+        self.tree.tag_configure("error", foreground="#7D3C98")
 
     # ---------------- UI 이벤트 및 핸들러 ----------------
 
@@ -218,6 +286,7 @@ class LifeCheckApp:
     def clear_input_fields(self):
         """입력 필드를 비우고 선택 상태를 초기화"""
         self.selected_item_id = None
+        self.selected_item_status = None
         self.entry_name.delete(0, tk.END)
         self.combo_category.set("화장품")
         self.set_today_date()
@@ -227,6 +296,25 @@ class LifeCheckApp:
         selected = self.tree.selection()
         if selected:
             self.tree.selection_remove(selected)
+        self.update_action_buttons()
+
+    def update_action_buttons(self):
+        """조회 조건 변경 후 숨겨진 제품을 잘못 수정하거나 삭제하지 않도록 선택 상태를 반영."""
+        selected = self.selected_item_id is not None
+        active = selected and self.selected_item_status == "사용중"
+        self.btn_update.configure(state="normal" if active else "disabled")
+        self.btn_delete.configure(state="normal" if selected else "disabled")
+        self.btn_complete.configure(state="normal" if active else "disabled")
+        self.btn_register_again.configure(
+            state="normal" if selected and not active else "disabled")
+
+    def load_items_safely(self):
+        """입출력 오류를 안내하고 실패와 빈 목록을 구분합니다."""
+        try:
+            return storage.load_items()
+        except (OSError, csv.Error) as exc:
+            messagebox.showerror("불러오기 실패", f"제품 데이터를 읽을 수 없습니다.\n{exc}")
+            return None
 
     def validate_inputs(self):
         """
@@ -292,10 +380,18 @@ class LifeCheckApp:
             return
 
         name, category, open_date, period_months, end_date = validated
-        storage.add_item(name, category, open_date, period_months, end_date)
+        try:
+            storage.add_item(name, category, open_date, period_months, end_date)
+        except (OSError, csv.Error, ValueError) as exc:
+            messagebox.showerror("저장 실패", f"제품을 등록하지 못했습니다.\n{exc}")
+            return
         
         messagebox.showinfo("등록 완료", f"'{name}' 제품이 성공적으로 등록되었습니다.")
         self.clear_input_fields()
+        self.view_var.set("사용 중")
+        self.filter_var.set("전체")
+        self.category_filter_var.set("전체")
+        self.search_var.set("")
         self.refresh_item_list()
 
     def handle_update(self):
@@ -304,12 +400,20 @@ class LifeCheckApp:
             messagebox.showwarning("선택 오류", "수정할 제품을 우측 목록에서 먼저 클릭하여 선택해 주세요.")
             return
 
+        if self.selected_item_status != "사용중":
+            messagebox.showwarning("수정 불가", "완료 이력은 보존됩니다. '같은 제품 다시 등록'을 이용해 주세요.")
+            return
+
         validated = self.validate_inputs()
         if not validated:
             return
 
         name, category, open_date, period_months, end_date = validated
-        success = storage.update_item(self.selected_item_id, name, category, open_date, period_months, end_date)
+        try:
+            success = storage.update_item(self.selected_item_id, name, category, open_date, period_months, end_date)
+        except (OSError, csv.Error, ValueError) as exc:
+            messagebox.showerror("저장 실패", f"제품을 수정하지 못했습니다.\n{exc}")
+            return
         
         if success:
             messagebox.showinfo("수정 완료", f"'{name}' 제품 정보가 수정되었습니다.")
@@ -329,7 +433,11 @@ class LifeCheckApp:
         if not confirm:
             return
 
-        success = storage.delete_item(self.selected_item_id)
+        try:
+            success = storage.delete_item(self.selected_item_id)
+        except (OSError, csv.Error, ValueError) as exc:
+            messagebox.showerror("저장 실패", f"제품을 삭제하지 못했습니다.\n{exc}")
+            return
         if success:
             messagebox.showinfo("삭제 완료", "제품이 삭제되었습니다.")
             self.clear_input_fields()
@@ -341,6 +449,9 @@ class LifeCheckApp:
         """목록에서 제품을 클릭했을 때 좌측 입력창에 해당 데이터를 채움"""
         selected_items = self.tree.selection()
         if not selected_items:
+            self.selected_item_id = None
+            self.selected_item_status = None
+            self.update_action_buttons()
             return
 
         item_row = self.tree.item(selected_items[0])
@@ -353,10 +464,14 @@ class LifeCheckApp:
         self.selected_item_id = item_id
 
         # storage에서 원본 데이터 찾아 개월 수 함께 로드
-        all_items = storage.load_items()
+        all_items = self.load_items_safely()
+        if all_items is None:
+            self.clear_input_fields()
+            return
         current_item = next((item for item in all_items if item["id"] == item_id), None)
 
         if current_item:
+            self.selected_item_status = current_item["usage_status"]
             self.entry_name.delete(0, tk.END)
             self.entry_name.insert(0, current_item["name"])
 
@@ -367,40 +482,50 @@ class LifeCheckApp:
 
             self.entry_period.delete(0, tk.END)
             self.entry_period.insert(0, str(current_item["period_months"]))
+            self.update_action_buttons()
+        else:
+            self.clear_input_fields()
 
     def refresh_item_list(self):
         """CSV 데이터를 읽고 현재 날짜 기준 계산 후 목록 및 요약 정보 갱신"""
+        all_items = self.load_items_safely()
+        if all_items is None:
+            return
+        self.clear_input_fields()
         # 기존 목록 비우기
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        all_items = storage.load_items()
-        current_filter = self.filter_var.get()
+        history = self.view_var.get() == "사용 완료 이력"
+        categories = ["전체"] + sorted({item["category"] for item in all_items})
+        self.category_filter_combo.configure(values=categories)
+        if self.category_filter_var.get() not in categories:
+            self.category_filter_var.set("전체")
+        for button in self.status_filter_buttons:
+            button.configure(state="disabled" if history else "normal")
+        self.sort_combo.configure(state="disabled" if history else "readonly")
+        active_columns = ("id", "name", "category", "open_date", "end_date", "remaining", "status")
+        self.tree.configure(displaycolumns=active_columns + ("completed_date",) if history else active_columns)
+        self.current_date = date.today()
+        self.today_label.configure(text=f"기준일: {self.current_date:%Y년 %m월 %d일}")
+        active_items = calculator.filter_items(all_items, urgent_days=self.urgent_days,
+                                                base_date=self.current_date)
+        urgent_count = sum(item["status"] == "기간임박" for item in active_items)
+        expired_count = sum(item["status"] == "기간만료" for item in active_items)
+        visible_items = calculator.filter_items(
+            all_items, query=self.search_var.get(), category=self.category_filter_var.get(),
+            status=self.filter_var.get(), history=history,
+            sort_by_remaining=self.sort_var.get() == "남은 기간순",
+            urgent_days=self.urgent_days, base_date=self.current_date)
 
-        total_count = len(all_items)
-        urgent_count = 0
-        expired_count = 0
-
-        for item in all_items:
-            try:
-                rem_days = calculator.calculate_remaining_days(item["end_date"])
-                status = calculator.get_item_status(rem_days)
-            except Exception:
-                rem_days = 0
-                status = "계산오류"
-
-            # 통계 집계
-            if status == "기간임박":
-                urgent_count += 1
-            elif status == "기간만료":
-                expired_count += 1
-
-            # 필터링 조건 확인
-            if current_filter != "전체" and status != current_filter:
-                continue
+        for item in visible_items:
+            rem_days = item["remaining_days"]
+            status = item["status"]
 
             # 남은 기간 표시 포맷
-            if rem_days > 0:
+            if rem_days is None:
+                rem_text = "—"
+            elif rem_days > 0:
                 rem_text = f"D-{rem_days} ({rem_days}일)"
             elif rem_days == 0:
                 rem_text = "D-Day (오늘)"
@@ -413,6 +538,10 @@ class LifeCheckApp:
                 tag = "expired"
             elif status == "기간임박":
                 tag = "urgent"
+            elif status == "사용완료":
+                tag = "completed"
+            elif status == "계산오류":
+                tag = "error"
 
             self.tree.insert(
                 "",
@@ -424,15 +553,100 @@ class LifeCheckApp:
                     item["open_date"],
                     item["end_date"],
                     rem_text,
-                    status
+                    status,
+                    item["completed_date"],
                 ),
                 tags=(tag,)
             )
 
         # 하단 요약 라벨 갱신
-        self.lbl_stat_total.config(text=f"전체 제품: {total_count}개")
+        self.lbl_stat_total.config(text=f"사용 중 제품: {len(active_items)}개")
         self.lbl_stat_urgent.config(text=f"⚠️ 기간 임박: {urgent_count}개")
         self.lbl_stat_expired.config(text=f"🚨 기간 만료: {expired_count}개")
+        self.lbl_stat_completed.config(text=f"사용 완료 이력: {len(all_items) - len(active_items)}개")
+        self.list_count_label.config(text=f"조회 결과: {len(visible_items)}개 · 임박 기준: {self.urgent_days}일")
+
+    # ---------------- 추가 기능 4·5 / 팀원 3 (계산·테스트 담당) ----------------
+
+    def handle_urgent_days_change(self, event=None):
+        days = int(self.urgent_days_var.get())
+        try:
+            storage.save_settings(days)
+        except (OSError, ValueError) as exc:
+            self.urgent_days_var.set(str(self.urgent_days))
+            messagebox.showerror("설정 저장 실패", str(exc))
+            return
+        self.urgent_days = days
+        self.refresh_item_list()
+
+    def show_startup_alert(self):
+        items = self.load_items_safely()
+        if items is None:
+            return
+        alerts = calculator.get_alert_items(items, self.urgent_days)
+        if not alerts:
+            return
+        expired = sum(item["status"] == "기간만료" for item in alerts)
+        lines = [f"임박 기준 {self.urgent_days}일 · 기간 임박 {len(alerts) - expired}개 · 기간 만료 {expired}개", ""]
+        for item in alerts[:10]:
+            days = item["remaining_days"]
+            period = f"{abs(days)}일 지남" if days < 0 else f"{days}일 남음"
+            lines.append(f"• {item['name']}: {item['status']} ({period})")
+        if len(alerts) > 10:
+            lines.append(f"외 {len(alerts) - 10}개 — 목록에서 확인해 주세요.")
+        messagebox.showinfo("교체 시기 안내", "\n".join(lines))
+
+    def handle_complete(self):
+        if self.selected_item_id is None or self.selected_item_status != "사용중":
+            messagebox.showwarning("선택 오류", "사용 완료 처리할 사용 중 제품을 선택해 주세요.")
+            return
+        completed_date = simpledialog.askstring(
+            "사용 완료", "사용 완료일을 입력해 주세요. (YYYY-MM-DD)",
+            initialvalue=date.today().isoformat(), parent=self.root)
+        if completed_date is None:
+            return
+        if not calculator.validate_date_format(completed_date):
+            messagebox.showwarning("날짜 형식 오류", "사용 완료일은 YYYY-MM-DD 형식의 유효한 날짜여야 합니다.")
+            return
+        try:
+            success = storage.complete_item(self.selected_item_id, completed_date)
+        except (OSError, csv.Error, ValueError) as exc:
+            messagebox.showerror("사용 완료 처리 실패", str(exc))
+            return
+        if success:
+            self.refresh_item_list()
+            messagebox.showinfo("사용 완료", "사용 완료 이력에 보관했습니다. 상단 목록에서 이력을 확인할 수 있습니다.")
+        else:
+            self.refresh_item_list()
+            messagebox.showwarning("처리 실패", "제품이 없거나 이미 사용 완료 처리되었습니다.")
+
+    def handle_register_again(self):
+        if self.selected_item_id is None or self.selected_item_status != "사용완료":
+            messagebox.showwarning("선택 오류", "사용 완료 이력에서 다시 등록할 제품을 선택해 주세요.")
+            return
+        items = self.load_items_safely()
+        if items is None:
+            return
+        item = next((item for item in items if item["id"] == self.selected_item_id), None)
+        if item is None:
+            self.refresh_item_list()
+            return
+        self.view_var.set("사용 중")
+        self.filter_var.set("전체")
+        self.category_filter_var.set("전체")
+        self.search_var.set("")
+        self.refresh_item_list()
+        self.entry_name.insert(0, item["name"])
+        self.combo_category.set(item["category"])
+        self.entry_period.insert(0, str(item["period_months"]))
+        self.entry_open_date.focus_set()
+        messagebox.showinfo("같은 제품 다시 등록", "기존 정보를 입력했습니다. 새 개봉일과 사용 기간을 확인한 뒤 '등록'을 눌러 주세요.")
+
+    def check_date_change(self):
+        """자정을 넘겨 계속 실행해도 기준일과 상태를 갱신합니다."""
+        if date.today() != self.current_date:
+            self.refresh_item_list()
+        self.root.after(60000, self.check_date_change)
 
 
 def main():

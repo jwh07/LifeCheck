@@ -9,14 +9,20 @@ LifeCheck - CSV 데이터 저장 및 관리 모듈 (storage.py)
 
 import os
 import csv
-from typing import List, Dict, Optional
+import json
+import tempfile
+from datetime import date
+from typing import List, Dict
 
 # 데이터 저장 디렉토리 및 CSV 파일 경로 설정
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CSV_FILE_PATH = os.path.join(DATA_DIR, "items.csv")
+SETTINGS_FILE_PATH = os.path.join(DATA_DIR, "settings.json")
 
-CSV_HEADERS = ["id", "name", "category", "open_date", "period_months", "end_date"]
+CSV_HEADERS = ["id", "name", "category", "open_date", "period_months", "end_date",
+               "usage_status", "completed_date"]
+URGENT_DAY_OPTIONS = (7, 14, 30)
 
 
 def init_storage() -> None:
@@ -62,10 +68,13 @@ def load_items() -> List[Dict]:
                     "category": row["category"],
                     "open_date": row["open_date"],
                     "period_months": int(row["period_months"]),
-                    "end_date": row["end_date"]
+                    "end_date": row["end_date"],
+                    # 기존 6열 CSV는 파일을 변경하지 않고 사용 중 제품으로 읽습니다.
+                    "usage_status": row.get("usage_status") or "사용중",
+                    "completed_date": row.get("completed_date") or "",
                 }
                 items.append(item)
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 # 손상되었거나 잘못된 행은 건너뜁니다.
                 continue
     return items
@@ -73,14 +82,34 @@ def load_items() -> List[Dict]:
 
 def save_items(items: List[Dict]) -> None:
     """
-    전체 제품 리스트를 CSV 파일에 덮어씁니다.
+    전체 제품 리스트를 CSV 파일에 저장합니다. 저장 실패 시 기존 파일을 보존합니다.
     """
     init_storage()
-    with open(CSV_FILE_PATH, mode="w", newline="", encoding="utf-8-sig") as f:
+    def write_csv(f):
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for item in items:
-            writer.writerow(item)
+            row = dict(item)
+            row.setdefault("usage_status", "사용중")
+            row.setdefault("completed_date", "")
+            writer.writerow(row)
+
+    _atomic_write(CSV_FILE_PATH, write_csv, "utf-8-sig")
+
+
+def _atomic_write(path: str, write_content, encoding: str) -> None:
+    """같은 폴더의 임시 파일에 쓴 뒤 교체하여 CSV와 설정 파일의 잘림을 방지합니다."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding=encoding, newline="",
+                                         dir=os.path.dirname(path), delete=False) as f:
+            temp_path = f.name
+            write_content(f)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def get_next_id(items: List[Dict]) -> int:
@@ -106,7 +135,9 @@ def add_item(name: str, category: str, open_date: str, period_months: int, end_d
         "category": category.strip(),
         "open_date": open_date.strip(),
         "period_months": int(period_months),
-        "end_date": end_date.strip()
+        "end_date": end_date.strip(),
+        "usage_status": "사용중",
+        "completed_date": "",
     }
     
     items.append(new_item)
@@ -124,6 +155,8 @@ def update_item(item_id: int, name: str, category: str, open_date: str, period_m
     
     for item in items:
         if item["id"] == item_id:
+            if item["usage_status"] == "사용완료":
+                return False  # 완료 이력은 새 제품 등록으로 재사용하며 원본은 보존합니다.
             item["name"] = name.strip()
             item["category"] = category.strip()
             item["open_date"] = open_date.strip()
@@ -147,6 +180,51 @@ def delete_item(item_id: int) -> bool:
     items = [item for item in items if item["id"] != item_id]
     
     if len(items) < initial_count:
+        save_items(items)
+        return True
+    return False
+
+
+# ---------------- 추가 기능 4·5 / 팀원 3 (계산·테스트 담당) ----------------
+
+def load_settings() -> Dict:
+    """설정이 없거나 손상된 경우 기본 임박 기준 30일을 사용합니다."""
+    try:
+        with open(SETTINGS_FILE_PATH, encoding="utf-8-sig") as f:
+            settings = json.load(f)
+        days = settings["urgent_days"]
+        if type(days) is int and days in URGENT_DAY_OPTIONS:
+            return {"urgent_days": days}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return {"urgent_days": 30}
+
+
+def save_settings(urgent_days: int) -> None:
+    """7·14·30일 중 선택한 임박 기준을 저장합니다."""
+    if type(urgent_days) is not int or urgent_days not in URGENT_DAY_OPTIONS:
+        raise ValueError("기간 임박 기준은 7일, 14일, 30일 중 선택해 주세요.")
+    _atomic_write(SETTINGS_FILE_PATH, lambda f: json.dump(
+        {"urgent_days": urgent_days}, f, ensure_ascii=False, indent=2
+    ), "utf-8")
+
+
+def complete_item(item_id: int, completed_date: str) -> bool:
+    """사용 중인 제품을 완료 처리합니다. 개봉일 이전·미래 완료일은 허용하지 않습니다."""
+    completed_date = completed_date.strip()
+    if len(completed_date) != 10:
+        raise ValueError("사용 완료일은 YYYY-MM-DD 형식으로 입력해 주세요.")
+    completed = date.fromisoformat(completed_date)
+    if completed > date.today():
+        raise ValueError("사용 완료일은 오늘 이후로 지정할 수 없습니다.")
+    items = load_items()
+    for item in items:
+        if item["id"] != item_id or item["usage_status"] == "사용완료":
+            continue
+        if completed < date.fromisoformat(item["open_date"]):
+            raise ValueError("사용 완료일은 개봉일보다 빠를 수 없습니다.")
+        item["usage_status"] = "사용완료"
+        item["completed_date"] = completed_date
         save_items(items)
         return True
     return False

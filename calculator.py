@@ -6,6 +6,7 @@ LifeCheck - 날짜 계산 및 상태 판정 모듈 (calculator.py)
 - 현재 날짜 기준 남은 일수 계산
 - 남은 일수에 따른 상태('사용가능', '기간임박', '기간만료') 판정
 - 날짜 형식 및 값에 대한 유효성 검사
+- [추가 기능 / 팀원 3] 검색·정렬, 맞춤 알림 대상 조회 및 사용 완료 이력 분리
 """
 
 from datetime import datetime, date
@@ -72,16 +73,69 @@ def calculate_remaining_days(end_date_str: str, base_date: date = None) -> int:
     return delta
 
 
-def get_item_status(remaining_days: int) -> str:
+def get_item_status(remaining_days: int, urgent_days: int = 30) -> str:
     """
     남은 일수를 기준으로 제품의 상태를 반환합니다.
     - 음수 (< 0): '기간만료'
-    - 0일 ~ 30일: '기간임박'
-    - 31일 이상: '사용가능'
+    - 0일 ~ urgent_days일: '기간임박' (기본 30일)
+    - urgent_days일 초과: '사용가능'
     """
     if remaining_days < 0:
         return "기간만료"
-    elif 0 <= remaining_days <= 30:
+    elif 0 <= remaining_days <= urgent_days:
         return "기간임박"
     else:
         return "사용가능"
+
+
+def get_item_details(item: dict, urgent_days: int = 30, base_date: date = None) -> dict:
+    """원본을 수정하지 않고 목록에 필요한 남은 일수와 상태를 덧붙입니다."""
+    details = dict(item)
+    if item.get("usage_status", "사용중") == "사용완료":
+        details.update(remaining_days=None, status="사용완료")
+        return details
+    try:
+        remaining = calculate_remaining_days(item["end_date"], base_date)
+        details.update(remaining_days=remaining, status=get_item_status(remaining, urgent_days))
+    except (ValueError, TypeError, KeyError):
+        details.update(remaining_days=None, status="계산오류")
+    return details
+
+
+def filter_items(items: list, query: str = "", category: str = "전체",
+                 status: str = "전체", history: bool = False,
+                 sort_by_remaining: bool = False, urgent_days: int = 30,
+                 base_date: date = None) -> list:
+    """검색·분류·상태 조건을 함께 적용하고 사용 중 목록과 완료 이력을 분리합니다."""
+    query = query.strip().casefold()
+    result = []
+    for item in items:
+        completed = item.get("usage_status", "사용중") == "사용완료"
+        if completed != history:
+            continue
+        if query not in item["name"].casefold():
+            continue
+        if category != "전체" and item["category"] != category:
+            continue
+        details = get_item_details(item, urgent_days, base_date)
+        if not history and status != "전체" and details["status"] != status:
+            continue
+        result.append(details)
+
+    if history:
+        result.sort(key=lambda item: (item.get("completed_date", ""), item["id"]), reverse=True)
+    elif sort_by_remaining:
+        # 날짜가 손상된 제품도 숨기지 않고 목록 마지막에 표시합니다.
+        result.sort(key=lambda item: (
+            item["remaining_days"] is None,
+            item["remaining_days"] if item["remaining_days"] is not None else 0,
+            item["id"],
+        ))
+    return result
+
+
+def get_alert_items(items: list, urgent_days: int = 30, base_date: date = None) -> list:
+    """검색 조건에 관계없이 사용 중인 모든 임박·만료 제품을 반환합니다."""
+    return [item for item in filter_items(
+        items, urgent_days=urgent_days, base_date=base_date, sort_by_remaining=True
+    ) if item["status"] in ("기간임박", "기간만료")]
